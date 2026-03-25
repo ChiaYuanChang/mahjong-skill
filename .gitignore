@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Game state & logs (runtime generated)
+skills/mahjong/.mahjong_state.json
+skills/mahjong/logs/
+
+# Node
+node_modules/
+
+# IDEs
+.idea/
+.jbeval/

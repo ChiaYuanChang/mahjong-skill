@@ -26,6 +26,267 @@ const SUIT_ORDER = { m: 0, p: 1, s: 2 };
 const HONOR_ORDER = { E: 0, S: 1, W: 2, N: 3, C: 4, F: 5, P: 6 };
 const SUIT_CODES = ["m", "p", "s"];
 const DRAW_RESERVE = 16;
+const DRAGON_TILES = new Set(["C", "F", "P"]);
+
+// ─── AI Personality System ───
+
+const AI_PERSONALITIES = {
+  aggressive: {
+    name: "衝鋒型",
+    claimThreshold: 0,
+    tingEagerness: 1.5,
+    honorKeepBonus: 0.3,
+    terminalKeepBonus: 0.2,
+  },
+  balanced: {
+    name: "穩健型",
+    claimThreshold: 2.0,
+    tingEagerness: 1.0,
+    honorKeepBonus: 1.2,
+    terminalKeepBonus: 0.8,
+  },
+  bigHand: {
+    name: "大牌型",
+    claimThreshold: 3.0,
+    tingEagerness: 0.5,
+    honorKeepBonus: 3.0,
+    terminalKeepBonus: 0.5,
+  },
+  speed: {
+    name: "速胡型",
+    claimThreshold: 0.5,
+    tingEagerness: 2.5,
+    honorKeepBonus: 0.0,
+    terminalKeepBonus: 0.0,
+  },
+};
+
+function makeSeatedRng(seed, seatIndex) {
+  let s = ((seed || 0) + seatIndex * 0x9E3779B9) >>> 0;
+  return function rng() {
+    s |= 0; s = s + 0x6D2B79F5 | 0;
+    let t = Math.imul(s ^ s >>> 15, 1 | s);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function evaluateStartingHand(hand) {
+  const counts = counterFrom(hand);
+  const suitCounts = { m: 0, p: 0, s: 0 };
+  let honorCount = 0;
+  let pairCount = 0;
+  let tripletCount = 0;
+  let isolatedCount = 0;
+  const dragonCounts = { C: 0, F: 0, P: 0 };
+
+  for (const [tile, count] of Object.entries(counts)) {
+    if (isSuited(tile)) {
+      suitCounts[tile.at(-1)] += count;
+    } else {
+      honorCount += count;
+      if (DRAGON_TILES.has(tile)) dragonCounts[tile] = count;
+    }
+    if (count >= 3) tripletCount++;
+    else if (count === 2) pairCount++;
+    else if (count === 1) {
+      if (isSuited(tile)) {
+        const n = parseInt(tile.slice(0, -1));
+        const s = tile.at(-1);
+        const hasNeighbor = (counts[`${n - 1}${s}`] || 0) > 0 || (counts[`${n + 1}${s}`] || 0) > 0;
+        if (!hasNeighbor) isolatedCount++;
+      } else {
+        isolatedCount++;
+      }
+    }
+  }
+
+  const sortedSuits = Object.entries(suitCounts).sort((a, b) => b[1] - a[1]);
+  const dominantSuit = sortedSuits[0][0];
+  const dominantCount = sortedSuits[0][1];
+  const dragonsWithTwo = Object.values(dragonCounts).filter(c => c >= 2).length;
+
+  return {
+    suitCounts, honorCount, dominantSuit, dominantCount,
+    pairCount, tripletCount, isolatedCount, dragonCounts, dragonsWithTwo,
+    pureOneSuitPotential: dominantCount >= 10 ? "high" : dominantCount >= 8 ? "medium" : "low",
+    mixedOneSuitPotential: (dominantCount + honorCount) >= 13 ? "high" : (dominantCount + honorCount) >= 10 ? "medium" : "low",
+    allTripletsPotential: (pairCount + tripletCount) >= 5 ? "high" : (pairCount + tripletCount) >= 4 ? "medium" : "low",
+    dragonPotential: dragonsWithTwo >= 3 ? "high" : dragonsWithTwo >= 2 ? "medium" : "low",
+  };
+}
+
+function assignPersonality(state, seat) {
+  const seatIndex = SEATS.indexOf(seat);
+  const rng = makeSeatedRng((state.front_index || 0) + (state.hand_index || 0) * 1000, seatIndex);
+
+  const types = ["aggressive", "balanced", "bigHand", "speed"];
+  const personality = types[Math.floor(rng() * types.length)];
+  const defense = rng();
+
+  const eval_ = evaluateStartingHand(state.hands[seat]);
+  let bigHandTarget = null;
+  let targetSuit = null;
+
+  if (personality === "bigHand" || personality === "balanced") {
+    const minLevel = personality === "bigHand" ? "medium" : "high";
+    const check = (val) => val === "high" || (minLevel === "medium" && val === "medium");
+
+    if (eval_.dragonPotential === "high") {
+      bigHandTarget = eval_.dragonsWithTwo >= 3 ? "大三元" : "小三元";
+    } else if (check(eval_.pureOneSuitPotential)) {
+      bigHandTarget = "清一色";
+      targetSuit = eval_.dominantSuit;
+    } else if (check(eval_.dragonPotential)) {
+      bigHandTarget = "小三元";
+    } else if (check(eval_.mixedOneSuitPotential)) {
+      bigHandTarget = "混一色";
+      targetSuit = eval_.dominantSuit;
+    } else if (check(eval_.allTripletsPotential)) {
+      bigHandTarget = "碰碰胡";
+    }
+  }
+
+  return {
+    personality, defense,
+    strategy: bigHandTarget ? "bigHand" : "normal",
+    bigHandTarget, targetSuit,
+    initialEval: eval_,
+    strategyLocked: false,
+  };
+}
+
+function bigHandKeepBonus(tile, hand, profile) {
+  let bonus = 0;
+  const target = profile.bigHandTarget;
+  const targetSuit = profile.targetSuit;
+
+  if (target === "清一色" || target === "混一色") {
+    if (isSuited(tile) && tile.at(-1) === targetSuit) {
+      bonus += 3.0;
+    } else if (isSuited(tile) && tile.at(-1) !== targetSuit) {
+      bonus -= 2.0;
+    }
+    if (target === "混一色" && isHonor(tile)) {
+      bonus += 2.0;
+    }
+  }
+  if (target === "碰碰胡") {
+    const count = hand.filter(t => t === tile).length;
+    if (count >= 2) bonus += 2.0;
+    if (count === 1 && isSuited(tile)) bonus -= 1.0;
+  }
+  if (target === "大三元" || target === "小三元") {
+    if (DRAGON_TILES.has(tile)) bonus += 4.0;
+  }
+  return bonus;
+}
+
+function dangerScore(tile, state, seat) {
+  let danger = 0;
+  const allDiscards = [];
+  for (const s of SEATS) {
+    allDiscards.push(...state.discards[s]);
+  }
+  const discardCounts = counterFrom(allDiscards);
+  const discardedCount = discardCounts[tile] || 0;
+  danger += (3 - discardedCount) * 1.5;
+
+  for (const s of SEATS) {
+    if (s === seat) continue;
+    if (state.declared_ting[s]) danger += 2.0;
+  }
+
+  if (isHonor(tile) && discardedCount === 0) {
+    const wLeft = wallRemaining(state) || 0;
+    if (wLeft < 40) danger += 2.0;
+  }
+
+  return danger;
+}
+
+function shouldClaim(state, seat, tile, claimType, profile) {
+  if (!profile) return true;
+  const config = AI_PERSONALITIES[profile.personality];
+  const hand = state.hands[seat];
+  const meldCount = state.melds[seat].length;
+
+  if (profile.bigHandTarget === "碰碰胡") {
+    if (claimType === "chow") return false;
+    if (claimType === "pong" || claimType === "kong") return true;
+  }
+  if (profile.strategy === "bigHand" && (profile.bigHandTarget === "清一色" || profile.bigHandTarget === "混一色")) {
+    if (isSuited(tile) && tile.at(-1) !== profile.targetSuit) return false;
+    if (profile.bigHandTarget === "清一色" && isHonor(tile)) return false;
+  }
+
+  const scoreBefore = structureScore(hand);
+  const remaining = [...hand];
+  if (claimType === "pong") {
+    remaining.splice(remaining.indexOf(tile), 1);
+    remaining.splice(remaining.indexOf(tile), 1);
+  } else if (claimType === "kong") {
+    for (let i = 0; i < 3; i++) remaining.splice(remaining.indexOf(tile), 1);
+  }
+  const scoreAfter = structureScore(remaining) + (claimType === "kong" ? 2 : 0);
+  const improvement = scoreAfter - scoreBefore + (meldCount + 1) * 0.5;
+
+  return improvement >= config.claimThreshold;
+}
+
+function shouldDeclareTing(state, seat, readyTiles, profile) {
+  if (!profile) return true;
+  if (profile.personality === "speed") return true;
+  if (profile.personality === "aggressive") return readyTiles.length >= 1;
+
+  if (profile.strategy === "bigHand") {
+    const wLeft = wallRemaining(state) || 0;
+    if (wLeft < 30) return true;
+    return readyTiles.length >= 3;
+  }
+
+  return readyTiles.length >= (AI_PERSONALITIES[profile.personality].tingEagerness > 1.0 ? 1 : 2);
+}
+
+function maybeReEvaluateStrategy(state, seat) {
+  const profile = state.ai_profiles?.[seat];
+  if (!profile || profile.strategyLocked || profile.strategy !== "bigHand") return;
+
+  const hand = state.hands[seat];
+  const melds = state.melds[seat];
+  const counts = counterFrom(hand);
+  const wLeft = wallRemaining(state) || 0;
+  const target = profile.bigHandTarget;
+  let abandon = false;
+
+  if (target === "清一色") {
+    const offSuit = hand.filter(t => isSuited(t) && t.at(-1) !== profile.targetSuit).length;
+    const meldOffSuit = melds.some(m => m.tiles.some(t => isSuited(t) && t.at(-1) !== profile.targetSuit));
+    if (offSuit > 4 || meldOffSuit) abandon = true;
+    if (wLeft < 40 && offSuit > 2) abandon = true;
+  } else if (target === "混一色") {
+    const offSuit = hand.filter(t => isSuited(t) && t.at(-1) !== profile.targetSuit).length;
+    if (offSuit > 3) abandon = true;
+    if (wLeft < 40 && offSuit > 1) abandon = true;
+  } else if (target === "碰碰胡") {
+    const singles = Object.values(counts).filter(c => c === 1).length;
+    if (singles > hand.length / 2) abandon = true;
+  } else if (target === "大三元" || target === "小三元") {
+    const dragonCounts = { C: 0, F: 0, P: 0 };
+    for (const t of hand) if (dragonCounts[t] !== undefined) dragonCounts[t]++;
+    for (const m of melds) for (const t of m.tiles) if (dragonCounts[t] !== undefined) dragonCounts[t] = 3;
+    const dragonsAlive = Object.values(dragonCounts).filter(c => c >= 2).length;
+    if (target === "大三元" && dragonsAlive < 3) abandon = true;
+    if (target === "小三元" && dragonsAlive < 2) abandon = true;
+  }
+
+  if (abandon) {
+    profile.strategy = "normal";
+    profile.bigHandTarget = null;
+    profile.targetSuit = null;
+    if (wLeft < 30) profile.defense = Math.min(1.0, profile.defense + 0.3);
+  }
+}
 
 // ─── State I/O ───
 
@@ -50,6 +311,7 @@ function ensureStateDefaults(state) {
   for (const [key, val] of Object.entries(defaults)) {
     if (state[key] == null) state[key] = val;
   }
+  if (!state.ai_profiles) state.ai_profiles = {};
   for (const bucket of ["hands", "flowers", "melds", "discards"]) {
     if (!state[bucket]) state[bucket] = {};
     for (const seat of SEATS) {
@@ -196,18 +458,28 @@ function structureScore(tiles) {
   return score;
 }
 
-function chooseDiscard(hand, meldCount) {
+function chooseDiscard(hand, meldCount, profile = null, state = null, seat = null) {
   const unique = [...new Set(hand)].sort(compareTiles);
   const candidates = [];
+  const config = profile ? AI_PERSONALITIES[profile.personality] : null;
+  const honorBonus = config ? config.honorKeepBonus : 1.2;
+  const terminalBonus = config ? config.terminalKeepBonus : 0.8;
+
   for (const tile of unique) {
     const remaining = [...hand];
     remaining.splice(remaining.indexOf(tile), 1);
     const winBonus = isStandardWin(remaining, meldCount) ? 500 : 0;
     let score = structureScore(remaining) + winBonus;
-    if (HONOR_NAMES[tile] && hand.filter(t => t === tile).length === 1) score += 1.2;
+    if (HONOR_NAMES[tile] && hand.filter(t => t === tile).length === 1) score += honorBonus;
     if (isSuited(tile)) {
       const number = parseInt(tile.slice(0, -1));
-      if ((number === 1 || number === 9) && hand.filter(t => t === tile).length === 1) score += 0.8;
+      if ((number === 1 || number === 9) && hand.filter(t => t === tile).length === 1) score += terminalBonus;
+    }
+    if (profile?.strategy === "bigHand" && profile.bigHandTarget) {
+      score += bigHandKeepBonus(tile, hand, profile);
+    }
+    if (profile && state && seat && profile.defense > 0.3) {
+      score += dangerScore(tile, state, seat) * profile.defense * 0.8;
     }
     candidates.push([score, tile]);
   }
@@ -548,6 +820,17 @@ function publicView(state) {
     visible_discards: visibleDiscards(state),
     available_actions: availableActions(state),
   };
+  view.ai_personalities = {};
+  for (const s of ["south", "west", "north"]) {
+    const p = state.ai_profiles?.[s];
+    if (p) {
+      view.ai_personalities[s] = {
+        type: AI_PERSONALITIES[p.personality].name,
+        defense: p.defense > 0.66 ? "高" : p.defense > 0.33 ? "中" : "低",
+        target: p.bigHandTarget || null,
+      };
+    }
+  }
   if (state.last_hand_summary) view.last_hand_summary = state.last_hand_summary;
   if (state.last_draw) {
     view.last_draw = {
@@ -619,12 +902,17 @@ function otherClaims(state, discarder, tile) {
     } else if (state.declared_ting[seat]) {
       continue;
     } else {
+      const profile = state.ai_profiles?.[seat] || null;
       const count = hand.filter(t => t === tile).length;
-      if (count >= 3) claims.push({ seat, type: "kong", priority: 2 });
-      if (count >= 2) claims.push({ seat, type: "pong", priority: 2 });
+      if (count >= 3 && shouldClaim(state, seat, tile, "kong", profile)) {
+        claims.push({ seat, type: "kong", priority: 2 });
+      }
+      if (count >= 2 && shouldClaim(state, seat, tile, "pong", profile)) {
+        claims.push({ seat, type: "pong", priority: 2 });
+      }
       if (seat === nextSeat(discarder)) {
         const chowSets = chowOptions(hand, tile);
-        if (chowSets.length) {
+        if (chowSets.length && shouldClaim(state, seat, tile, "chow", profile)) {
           claims.push({ seat, type: "chow", priority: 1, options: chowSets });
         }
       }
@@ -722,16 +1010,20 @@ function performAiClaim(state, claim, discarder, tile, log) {
   }
 
   state.hands[seat] = sortedTiles(hand);
+  const claimProfile = state.ai_profiles?.[seat] || null;
+  maybeReEvaluateStrategy(state, seat);
   let discard;
   if (state.declared_ting[seat]) {
     discard = state.last_draw?.tile || hand[hand.length - 1];
     if (!hand.includes(discard)) discard = hand[hand.length - 1];
   } else {
-    discard = chooseDiscard(state.hands[seat], state.melds[seat].length);
+    discard = chooseDiscard(state.hands[seat], state.melds[seat].length, claimProfile, state, seat);
     const remaining = [...state.hands[seat]];
     remaining.splice(remaining.indexOf(discard), 1);
-    if (readyTilesForHand(remaining, state.melds[seat].length).length) {
+    const readyTiles = readyTilesForHand(remaining, state.melds[seat].length);
+    if (readyTiles.length && shouldDeclareTing(state, seat, readyTiles, claimProfile)) {
       markDeclaredTing(state, seat);
+      if (claimProfile) claimProfile.strategyLocked = true;
     }
   }
   state.hands[seat].splice(state.hands[seat].indexOf(discard), 1);
@@ -777,15 +1069,19 @@ function runAiTurn(state, seat, log) {
     return;
   }
 
+  const turnProfile = state.ai_profiles?.[seat] || null;
+  maybeReEvaluateStrategy(state, seat);
   let discard;
   if (state.declared_ting[seat]) {
     discard = draw;
   } else {
-    discard = chooseDiscard(state.hands[seat], state.melds[seat].length);
+    discard = chooseDiscard(state.hands[seat], state.melds[seat].length, turnProfile, state, seat);
     const remaining = [...state.hands[seat]];
     remaining.splice(remaining.indexOf(discard), 1);
-    if (readyTilesForHand(remaining, state.melds[seat].length).length) {
+    const readyTiles = readyTilesForHand(remaining, state.melds[seat].length);
+    if (readyTiles.length && shouldDeclareTing(state, seat, readyTiles, turnProfile)) {
       markDeclaredTing(state, seat);
+      if (turnProfile) turnProfile.strategyLocked = true;
       log.push(`${SEAT_NAMES[seat]}宣告聽牌。`);
     }
   }
@@ -940,6 +1236,13 @@ function initializeHand(state, seed) {
     }
   }
 
+  // Assign AI personalities after dealing
+  state.ai_profiles = {};
+  for (const seat of SEATS) {
+    if (seat === "east") continue;
+    state.ai_profiles[seat] = assignPersonality(state, seat);
+  }
+
   if (state.flower_special_candidate) {
     const specialSeat = state.flower_special_candidate.seat;
     const winningTile = state.hands[specialSeat].length ? state.hands[specialSeat].at(-1) : null;
@@ -961,11 +1264,14 @@ function initializeHand(state, seed) {
       markWinner(state, dealer, "tsumo", { tile: state.hands[dealer].at(-1), heaven_win: true });
       return { status: "ended", log: [`${SEAT_NAMES[dealer]}天胡。`], winner: state.winner };
     }
-    const firstTile = chooseDiscard(state.hands[dealer], state.melds[dealer].length);
+    const dealerProfile = state.ai_profiles[dealer] || null;
+    const firstTile = chooseDiscard(state.hands[dealer], state.melds[dealer].length, dealerProfile, state, dealer);
     const remaining = [...state.hands[dealer]];
     remaining.splice(remaining.indexOf(firstTile), 1);
-    if (readyTilesForHand(remaining, state.melds[dealer].length).length) {
+    const readyTiles = readyTilesForHand(remaining, state.melds[dealer].length);
+    if (readyTiles.length && shouldDeclareTing(state, dealer, readyTiles, dealerProfile)) {
       markDeclaredTing(state, dealer);
+      if (dealerProfile) dealerProfile.strategyLocked = true;
     }
     state.hands[dealer].splice(state.hands[dealer].indexOf(firstTile), 1);
     registerDiscard(state, dealer, firstTile);
